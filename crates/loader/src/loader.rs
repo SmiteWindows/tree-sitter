@@ -44,6 +44,8 @@ use tree_sitter_tags::{Error as TagsError, TagsConfiguration};
 static GRAMMAR_NAME_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""name":\s*"(.*?)""#).unwrap());
 
+static WASM_TOOL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 const WASI_SDK_VERSION: &str = include_str!("../wasi-sdk-version").trim_ascii();
 const BINARYEN_VERSION: &str = include_str!("../binaryen-version").trim_ascii();
 
@@ -579,6 +581,40 @@ fn standardize_path(path: PathBuf, home: &Path) -> PathBuf {
     path
 }
 
+fn display_build_cmd(cmd: &Command) {
+    let mut env_vars = String::new();
+    for (key, val) in cmd.get_envs() {
+        env_vars.push_str(&key.to_string_lossy());
+        if let Some(v) = val {
+            env_vars.push('=');
+            env_vars.push_str(&v.to_string_lossy());
+        }
+        env_vars.push('\n');
+    }
+    if !env_vars.is_empty() {
+        env_vars.pop(); // remove last '\n'
+    }
+    info!(
+        "[{}] {} {}\n",
+        cmd.get_current_dir()
+            .unwrap_or_else(|| Path::new(""))
+            .display(),
+        cmd.get_program().to_string_lossy(),
+        cmd.get_args()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    for (key, val) in cmd.get_envs() {
+        let mut env_str = key.to_string_lossy().to_string();
+        if let Some(v) = val {
+            env_str.push('=');
+            env_str.push_str(&v.to_string_lossy());
+        }
+        info!("{env_str}");
+    }
+}
+
 impl Config {
     #[must_use]
     pub fn initial() -> Self {
@@ -636,6 +672,7 @@ pub struct Loader {
     debug_build: bool,
     sanitize_build: bool,
     force_rebuild: bool,
+    verbose: bool,
 
     #[cfg(feature = "wasm")]
     wasm_store: Mutex<Option<tree_sitter::WasmStore>>,
@@ -716,6 +753,7 @@ impl Loader {
             debug_build: false,
             sanitize_build: false,
             force_rebuild: false,
+            verbose: false,
 
             #[cfg(feature = "wasm")]
             wasm_store: Mutex::default(),
@@ -1241,12 +1279,25 @@ impl Loader {
             None
         };
 
+        if self.verbose {
+            display_build_cmd(&command);
+        }
+
         let output = command.output().map_err(|e| {
             LoaderError::Compiler(CompilerError {
                 error: e,
                 command: Box::new(command),
             })
         })?;
+
+        if self.verbose {
+            if !output.stdout.is_empty() {
+                info!("stdout:{}", String::from_utf8_lossy(&output.stdout));
+            }
+            if !output.stderr.is_empty() {
+                info!("stderr:{}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
 
         if let Some(temp_dir) = temp_dir {
             let _ = fs::remove_dir_all(temp_dir);
@@ -1329,11 +1380,15 @@ impl Loader {
         scanner_filename: Option<&Path>,
         output_path: &Path,
     ) -> LoaderResult<()> {
+        let tool_lock = WASM_TOOL_LOCK.lock().expect("Wasm tool mutex poisoned");
         let clang_exe = self.ensure_wasi_sdk_exists()?;
+        let wasm_opt_exe = self.ensure_binaryen_exists()?;
+        drop(tool_lock);
+
         let output_path = output_path.to_str().unwrap();
 
-        let mut command = Command::new(&clang_exe);
-        command.current_dir(src_path).args([
+        let mut compile_command = Command::new(&clang_exe);
+        compile_command.current_dir(src_path).args([
             "-o",
             output_path,
             "-fPIC",
@@ -1352,10 +1407,24 @@ impl Loader {
         ]);
 
         if let Some(scanner_filename) = scanner_filename {
-            command.arg(scanner_filename);
+            compile_command.arg(scanner_filename);
         }
 
-        let compile_output = command.output().map_err(LoaderError::WasmCompiler)?;
+        if self.verbose {
+            display_build_cmd(&compile_command);
+        }
+
+        let compile_output = compile_command
+            .output()
+            .map_err(LoaderError::WasmCompiler)?;
+        if self.verbose {
+            if !compile_output.stdout.is_empty() {
+                info!("stdout:{}", String::from_utf8_lossy(&compile_output.stdout));
+            }
+            if !compile_output.stderr.is_empty() {
+                info!("stderr:{}", String::from_utf8_lossy(&compile_output.stderr));
+            }
+        }
 
         if !compile_output.status.success() {
             return Err(LoaderError::WasmCompilation(
@@ -1363,12 +1432,24 @@ impl Loader {
             ));
         }
 
-        let wasm_opt_exe = self.ensure_binaryen_exists()?;
+        let mut opt_command = Command::new(&wasm_opt_exe);
+        opt_command
+            .current_dir(src_path)
+            .args([output_path, "-Os", "-o", output_path]);
 
-        let opt_output = Command::new(&wasm_opt_exe)
-            .args([output_path, "-Os", "-o", output_path])
-            .output()
-            .map_err(LoaderError::WasmOptimizer)?;
+        if self.verbose {
+            display_build_cmd(&opt_command);
+        }
+
+        let opt_output = opt_command.output().map_err(LoaderError::WasmOptimizer)?;
+        if self.verbose {
+            if !opt_output.stdout.is_empty() {
+                info!("stdout:{}", String::from_utf8_lossy(&opt_output.stdout));
+            }
+            if !opt_output.stderr.is_empty() {
+                info!("stderr:{}", String::from_utf8_lossy(&opt_output.stderr));
+            }
+        }
 
         if !opt_output.status.success() {
             return Err(LoaderError::WasmOptimization(
@@ -1551,7 +1632,13 @@ impl Loader {
         })?;
 
         info!("Downloading {tool_name} from {url}...");
-        let temp_tar_path = cache_dir.join(filename);
+        let temp_tar_dir = tempfile::tempdir_in(&cache_dir).map_err(|e| {
+            LoaderError::IO(IoError {
+                error: e,
+                path: Some(cache_dir.to_string_lossy().to_string()),
+            })
+        })?;
+        let temp_tar_path = temp_tar_dir.path().join(filename);
 
         let status = Command::new("curl")
             .arg("-f")
@@ -1572,7 +1659,6 @@ impl Loader {
         info!("Extracting {tool_name} to {}...", tool_dir.display());
         self.extract_tar_gz_with_strip(&temp_tar_path, &tool_dir)?;
 
-        fs::remove_file(temp_tar_path).ok();
         for exe in possible_exes {
             let tool_exe = tool_dir.join("bin").join(exe);
             if tool_exe.exists() {
@@ -1873,6 +1959,10 @@ impl Loader {
 
     pub const fn force_rebuild(&mut self, rebuild: bool) {
         self.force_rebuild = rebuild;
+    }
+
+    pub const fn verbose_build(&mut self, verbose: bool) {
+        self.verbose = verbose;
     }
 
     #[cfg(feature = "wasm")]
